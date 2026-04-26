@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LocalSend Web</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">LAN Drop</p>
+          <h1>Browser-first file sharing on your local network.</h1>
+          <p class="lead">
+            Pick files, discover nearby devices over UDP broadcast, send them over HTTP,
+            and watch device or download updates in real time through WebSocket events.
+          </p>
+        </div>
+        <div class="hero-card">
+          <p class="card-label">This device</p>
+          <div id="self-device" class="device-meta">Loading...</div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">1. Select files</p>
+              <h2>Upload queue</h2>
+            </div>
+            <label class="picker">
+              <input id="file-input" type="file" multiple />
+              <span>Choose files</span>
+            </label>
+          </div>
+          <ul id="selected-files" class="file-list empty">
+            <li>No files selected yet.</li>
+          </ul>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">2. Nearby devices</p>
+              <h2>LAN discovery</h2>
+            </div>
+            <button id="refresh-btn" class="ghost" type="button">Refresh</button>
+          </div>
+          <div id="peers" class="device-grid"></div>
+        </article>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">3. Upload progress</p>
+              <h2>Transfers</h2>
+            </div>
+          </div>
+          <div id="uploads" class="upload-list empty">No active uploads.</div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="panel-kicker">4. Download list</p>
+              <h2>Received files</h2>
+            </div>
+          </div>
+          <div id="downloads" class="download-list empty">No files received yet.</div>
+        </article>
+      </section>
+    </main>
+
+    <template id="peer-template">
+      <article class="device-card">
+        <div class="device-card-head">
+          <div>
+            <h3 class="device-name"></h3>
+            <p class="device-address"></p>
+          </div>
+          <span class="pill auth-pill"></span>
+        </div>
+        <label class="pin-wrap">
+          <span>PIN</span>
+          <input class="pin-input" type="password" placeholder="Optional" />
+        </label>
+        <button class="send-btn" type="button">Send selected files</button>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

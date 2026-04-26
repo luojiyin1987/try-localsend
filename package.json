@@ -1,0 +1,22 @@
+{
+  "name": "try-localsend-web",
+  "version": "0.1.0",
+  "description": "LAN file sharing prototype inspired by LocalSend with a browser frontend and Node.js backend",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "smoke": "node scripts/smoke-test.js"
+  },
+  "keywords": [
+    "localsend",
+    "lan",
+    "fileshare",
+    "websocket",
+    "udp"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}
