@@ -24,14 +24,27 @@ fileInputEl.addEventListener('change', (event) => {
 });
 
 refreshBtnEl.addEventListener('click', async () => {
+  await requestScan();
   await Promise.all([loadPeers(), loadDownloads()]);
 });
 
 await bootstrap();
 
 async function bootstrap() {
-  await Promise.all([loadSelf(), loadPeers(), loadDownloads()]);
+  await Promise.all([loadSelf(), loadDownloads()]);
+  await requestScan();
+  await loadPeers();
   connectSocket();
+}
+
+async function requestScan() {
+  try {
+    await fetch('/api/scan', {
+      method: 'POST'
+    });
+  } catch {
+    // Discovery remains best-effort. The WebSocket snapshot will refresh if the scan succeeds later.
+  }
 }
 
 async function loadSelf() {

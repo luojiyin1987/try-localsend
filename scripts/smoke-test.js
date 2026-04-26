@@ -56,7 +56,14 @@ try {
   assert.equal(peersResponse.status, 200);
   const peersPayload = await peersResponse.json();
   assert.ok(Array.isArray(peersPayload.peers));
-  assert.equal(peersPayload.peers[0].fingerprint, 'peer-device-fingerprint');
+  assert.ok(peersPayload.peers.some((peer) => peer.fingerprint === 'peer-device-fingerprint'));
+
+  const scanResponse = await fetch(`http://127.0.0.1:${port}/api/scan`, {
+    method: 'POST'
+  });
+  assert.equal(scanResponse.status, 200);
+  const scanPayload = await scanResponse.json();
+  assert.equal(typeof scanPayload.scanned, 'number');
 
   const uploadsResponse = await fetch(`http://127.0.0.1:${port}/api/downloads`);
   assert.equal(uploadsResponse.status, 200);

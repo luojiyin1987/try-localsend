@@ -47,6 +47,7 @@ Open `http://127.0.0.1:53317`.
 ## Compatibility
 
 - Discovery is compatible with the official LocalSend multicast/register flow.
+- If multicast discovery fails, the server can actively scan the local subnet with `POST /api/scan`, following LocalSend's legacy HTTP registration approach.
 - File transfer is still this prototype's custom HTTP API, not the official LocalSend upload API.
 - Native LocalSend apps can appear in the nearby-device list, but browser uploads remain disabled unless the peer also exposes this prototype's `/api/info` and upload endpoints.
 

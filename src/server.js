@@ -21,6 +21,9 @@ const ANNOUNCE_INTERVAL_MS = Number.parseInt(process.env.ANNOUNCE_INTERVAL_MS ||
 const PEER_TTL_MS = Number.parseInt(process.env.PEER_TTL_MS || '15000', 10);
 const PROTOCOL_VERSION = (process.env.PROTOCOL_VERSION || '2.0').trim();
 const HTTP_PROTOCOL = (process.env.HTTP_PROTOCOL || 'http').trim();
+const SCAN_TIMEOUT_MS = Number.parseInt(process.env.SCAN_TIMEOUT_MS || '900', 10);
+const SCAN_CONCURRENCY = Number.parseInt(process.env.SCAN_CONCURRENCY || '24', 10);
+const SCAN_HOST_LIMIT = Number.parseInt(process.env.SCAN_HOST_LIMIT || '256', 10);
 const ACCESS_PIN = (process.env.ACCESS_PIN || '').trim();
 const DEVICE_NAME = (process.env.DEVICE_NAME || os.hostname()).trim();
 const DEVICE_MODEL = (process.env.DEVICE_MODEL || os.type()).trim();
@@ -37,10 +40,11 @@ const DEVICE_ID = process.env.DEVICE_ID || FINGERPRINT;
 const peers = new Map();
 const downloads = [];
 const sockets = new Set();
-const localAddress = pickLocalAddress();
-const localInterfaces = listLocalIpv4Addresses();
+const localInterfaces = listLocalIpv4Interfaces();
+const localAddress = localInterfaces[0]?.address || '127.0.0.1';
 const activeProbes = new Set();
 const recentRegisterReplies = new Map();
+let scanPromise = null;
 
 await fsp.mkdir(downloadDir, { recursive: true });
 await loadExistingDownloads();
@@ -85,6 +89,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && requestUrl.pathname === '/api/downloads') {
       return sendJson(res, 200, { downloads: listDownloads() });
+    }
+
+    if (req.method === 'POST' && requestUrl.pathname === '/api/scan') {
+      const result = await scanLocalSubnet();
+      return sendJson(res, 200, result);
     }
 
     if (req.method === 'POST' && requestUrl.pathname === '/api/localsend/v2/register') {
@@ -135,6 +144,7 @@ server.listen(HTTP_PORT, () => {
   if (ACCESS_PIN) {
     console.log('[auth] upload PIN enabled');
   }
+  void scanLocalSubnet();
 });
 
 const announceTimer = setInterval(announceSelf, ANNOUNCE_INTERVAL_MS);
@@ -441,14 +451,18 @@ function pickLocalAddress() {
   return '127.0.0.1';
 }
 
-function listLocalIpv4Addresses() {
+function listLocalIpv4Interfaces() {
   const interfaces = os.networkInterfaces();
   const addresses = [];
 
   for (const entries of Object.values(interfaces)) {
     for (const entry of entries || []) {
       if (entry.family === 'IPv4' && !entry.internal) {
-        addresses.push(entry.address);
+        addresses.push({
+          address: entry.address,
+          netmask: entry.netmask,
+          cidr: entry.cidr || `${entry.address}/${prefixFromNetmask(entry.netmask)}`
+        });
       }
     }
   }
@@ -494,11 +508,11 @@ function joinDiscoveryGroups() {
     return;
   }
 
-  for (const address of localInterfaces) {
+  for (const iface of localInterfaces) {
     try {
-      discoverySocket.addMembership(DISCOVERY_ADDRESS, address);
+      discoverySocket.addMembership(DISCOVERY_ADDRESS, iface.address);
     } catch (error) {
-      console.warn(`[udp] addMembership failed for ${address}`, error.message);
+      console.warn(`[udp] addMembership failed for ${iface.address}`, error.message);
     }
   }
 }
@@ -654,6 +668,105 @@ function updatePeerCompatibility(peerId, supportsCustomUpload) {
   broadcastJson({ type: 'peers', peers: listPeers() });
 }
 
+async function scanLocalSubnet() {
+  if (scanPromise) {
+    return scanPromise;
+  }
+
+  scanPromise = performSubnetScan().finally(() => {
+    scanPromise = null;
+  });
+
+  return scanPromise;
+}
+
+async function performSubnetScan() {
+  const candidates = buildScanTargets();
+  if (candidates.length === 0) {
+    return { scanned: 0, found: 0, peers: listPeers() };
+  }
+
+  let found = 0;
+  let index = 0;
+
+  async function worker() {
+    while (index < candidates.length) {
+      const current = candidates[index];
+      index += 1;
+      found += await tryRegisterCandidate(current);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(SCAN_CONCURRENCY, candidates.length) }, () => worker());
+  await Promise.all(workers);
+
+  broadcastJson({ type: 'peers', peers: listPeers() });
+  return { scanned: candidates.length, found, peers: listPeers() };
+}
+
+function buildScanTargets() {
+  const targets = new Set();
+
+  for (const iface of localInterfaces) {
+    for (const address of enumerateSubnetHosts(iface)) {
+      if (address !== iface.address) {
+        targets.add(address);
+      }
+    }
+  }
+
+  return [...targets];
+}
+
+function enumerateSubnetHosts(iface) {
+  const prefix = prefixFromNetmask(iface.netmask);
+  if (prefix < 16) {
+    return [];
+  }
+
+  const ipInt = ipv4ToInt(iface.address);
+  const maskInt = ipv4ToInt(iface.netmask);
+  const networkInt = ipInt & maskInt;
+  const broadcastInt = networkInt | (~maskInt >>> 0);
+  const results = [];
+
+  for (let value = networkInt + 1; value < broadcastInt; value += 1) {
+    results.push(intToIpv4(value >>> 0));
+    if (results.length >= SCAN_HOST_LIMIT) {
+      break;
+    }
+  }
+
+  return results;
+}
+
+async function tryRegisterCandidate(address) {
+  try {
+    const response = await fetch(`http://${address}:53317/api/localsend/v2/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(buildLocalSendIdentity()),
+      signal: AbortSignal.timeout(SCAN_TIMEOUT_MS)
+    });
+
+    if (!response.ok) {
+      return 0;
+    }
+
+    const payload = await response.json();
+    if (!isLocalSendPeerPayload(payload)) {
+      return 0;
+    }
+
+    upsertPeer(normalizeLocalSendPeer(payload, address, 'http-scan', { httpPort: 53317, protocol: 'http' }));
+    return 1;
+  } catch {
+    return 0;
+  }
+}
+
 async function readJsonBody(req) {
   const chunks = [];
   for await (const chunk of req) {
@@ -677,6 +790,27 @@ function normalizeRemoteAddress(address) {
   }
 
   return address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
+}
+
+function prefixFromNetmask(netmask) {
+  return netmask
+    .split('.')
+    .map((part) => Number.parseInt(part, 10).toString(2).padStart(8, '0'))
+    .join('')
+    .replaceAll('0', '').length;
+}
+
+function ipv4ToInt(address) {
+  return address.split('.').reduce((accumulator, part) => ((accumulator << 8) | Number.parseInt(part, 10)) >>> 0, 0);
+}
+
+function intToIpv4(value) {
+  return [
+    (value >>> 24) & 255,
+    (value >>> 16) & 255,
+    (value >>> 8) & 255,
+    value & 255
+  ].join('.');
 }
 
 function contentTypeFor(filePath) {
