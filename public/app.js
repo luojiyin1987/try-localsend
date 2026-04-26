@@ -133,20 +133,23 @@ function renderPeers() {
   for (const peer of state.peers) {
     const node = peerTemplate.content.firstElementChild.cloneNode(true);
     node.querySelector('.device-name').textContent = peer.name;
-    node.querySelector('.device-address').textContent = `${peer.baseUrl}`;
+    node.querySelector('.device-address').textContent =
+      `${peer.baseUrl} · ${peer.deviceType || 'device'} · ${peer.discoveryMethod}`;
 
     const pill = node.querySelector('.auth-pill');
-    pill.textContent = peer.tokenRequired ? 'PIN required' : 'Open';
-    pill.dataset.secure = String(peer.tokenRequired);
+    pill.textContent = capabilityLabel(peer);
+    pill.dataset.secure = String(peer.tokenRequired || peer.supportsCustomUpload === false);
 
     const pinInput = node.querySelector('.pin-input');
     pinInput.value = state.peerPins[peer.id] || '';
     pinInput.addEventListener('input', (event) => {
       state.peerPins[peer.id] = event.target.value;
     });
+    pinInput.disabled = peer.supportsCustomUpload !== true;
 
     const sendButton = node.querySelector('.send-btn');
-    sendButton.disabled = state.files.length === 0;
+    sendButton.disabled = state.files.length === 0 || peer.supportsCustomUpload !== true;
+    sendButton.textContent = peer.supportsCustomUpload === true ? 'Send selected files' : 'Discovery only';
     sendButton.addEventListener('click', () => sendFilesToPeer(peer));
 
     peersEl.appendChild(node);
@@ -306,4 +309,20 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+function capabilityLabel(peer) {
+  if (peer.supportsCustomUpload === true) {
+    return peer.tokenRequired ? 'PIN required' : 'Send ready';
+  }
+
+  if (peer.supportsCustomUpload === null) {
+    return 'Checking upload API';
+  }
+
+  if (peer.protocol === 'https') {
+    return 'LocalSend HTTPS';
+  }
+
+  return 'LocalSend discovery';
 }

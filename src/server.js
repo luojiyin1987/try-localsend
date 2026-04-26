@@ -15,23 +15,32 @@ const publicDir = path.join(projectRoot, 'public');
 const downloadDir = path.resolve(process.env.DOWNLOAD_DIR || path.join(projectRoot, 'downloads'));
 
 const HTTP_PORT = Number.parseInt(process.env.PORT || '53317', 10);
-const DISCOVERY_PORT = Number.parseInt(process.env.DISCOVERY_PORT || '53318', 10);
+const DISCOVERY_PORT = Number.parseInt(process.env.DISCOVERY_PORT || '53317', 10);
+const DISCOVERY_ADDRESS = (process.env.DISCOVERY_ADDRESS || '224.0.0.167').trim();
 const ANNOUNCE_INTERVAL_MS = Number.parseInt(process.env.ANNOUNCE_INTERVAL_MS || '5000', 10);
 const PEER_TTL_MS = Number.parseInt(process.env.PEER_TTL_MS || '15000', 10);
+const PROTOCOL_VERSION = (process.env.PROTOCOL_VERSION || '2.0').trim();
+const HTTP_PROTOCOL = (process.env.HTTP_PROTOCOL || 'http').trim();
 const ACCESS_PIN = (process.env.ACCESS_PIN || '').trim();
 const DEVICE_NAME = (process.env.DEVICE_NAME || os.hostname()).trim();
-const DEVICE_ID =
-  process.env.DEVICE_ID ||
+const DEVICE_MODEL = (process.env.DEVICE_MODEL || os.type()).trim();
+const DEVICE_TYPE = (process.env.DEVICE_TYPE || 'web').trim();
+const FINGERPRINT =
+  process.env.FINGERPRINT ||
   crypto
-    .createHash('sha1')
-    .update(`${DEVICE_NAME}:${HTTP_PORT}`)
+    .createHash('sha256')
+    .update(`${DEVICE_NAME}:${HTTP_PORT}:${os.hostname()}`)
     .digest('hex')
-    .slice(0, 12);
+    .slice(0, 64);
+const DEVICE_ID = process.env.DEVICE_ID || FINGERPRINT;
 
 const peers = new Map();
 const downloads = [];
 const sockets = new Set();
 const localAddress = pickLocalAddress();
+const localInterfaces = listLocalIpv4Addresses();
+const activeProbes = new Set();
+const recentRegisterReplies = new Map();
 
 await fsp.mkdir(downloadDir, { recursive: true });
 await loadExistingDownloads();
@@ -43,31 +52,15 @@ discoverySocket.on('error', (error) => {
 
 discoverySocket.on('message', (message, rinfo) => {
   const payload = tryParseJson(message);
-  if (!payload || payload.type !== 'announce' || payload.id === DEVICE_ID) {
-    return;
-  }
-
-  const peer = {
-    id: payload.id,
-    name: payload.name || 'Unknown Device',
-    address: rinfo.address === '127.0.0.1' ? payload.address || rinfo.address : rinfo.address,
-    httpPort: Number(payload.httpPort) || HTTP_PORT,
-    tokenRequired: Boolean(payload.tokenRequired),
-    lastSeen: Date.now()
-  };
-
-  const previous = peers.get(peer.id);
-  peers.set(peer.id, peer);
-
-  if (!previous || hasPeerChanged(previous, peer)) {
-    broadcastJson({ type: 'peers', peers: listPeers() });
-  }
+  void handleDiscoveryMessage(payload, rinfo);
 });
 
 discoverySocket.bind(DISCOVERY_PORT, () => {
-  discoverySocket.setBroadcast(true);
+  discoverySocket.setMulticastTTL(1);
+  discoverySocket.setMulticastLoopback(true);
+  joinDiscoveryGroups();
   announceSelf();
-  console.log(`[udp] discovery listening on :${DISCOVERY_PORT}`);
+  console.log(`[udp] discovery listening on ${DISCOVERY_ADDRESS}:${DISCOVERY_PORT}`);
 });
 
 const server = http.createServer(async (req, res) => {
@@ -92,6 +85,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && requestUrl.pathname === '/api/downloads') {
       return sendJson(res, 200, { downloads: listDownloads() });
+    }
+
+    if (req.method === 'POST' && requestUrl.pathname === '/api/localsend/v2/register') {
+      return handleLocalSendRegister(req, res, requestUrl);
     }
 
     if (req.method === 'PUT' && requestUrl.pathname.startsWith('/api/files/')) {
@@ -133,6 +130,7 @@ wsServer.on('connection', (socket) => {
 server.listen(HTTP_PORT, () => {
   console.log(`[http] listening on http://0.0.0.0:${HTTP_PORT}`);
   console.log(`[device] ${DEVICE_NAME} (${DEVICE_ID})`);
+  console.log(`[localsend] fingerprint ${FINGERPRINT}`);
   console.log(`[storage] ${downloadDir}`);
   if (ACCESS_PIN) {
     console.log('[auth] upload PIN enabled');
@@ -218,6 +216,17 @@ async function handleIncomingFile(req, res, requestUrl) {
   }
 }
 
+async function handleLocalSendRegister(req, res, _requestUrl) {
+  const payload = await readJsonBody(req);
+  if (!isLocalSendPeerPayload(payload) || !hasEndpointInfo(payload)) {
+    return sendJson(res, 400, { error: 'Invalid LocalSend register payload' });
+  }
+
+  const remoteAddress = normalizeRemoteAddress(req.socket.remoteAddress);
+  upsertPeer(normalizeLocalSendPeer(payload, remoteAddress, 'http-register'));
+  sendJson(res, 200, buildLocalSendIdentity());
+}
+
 async function handleDownload(_req, res, requestUrl) {
   const fileId = requestUrl.pathname.slice('/downloads/'.length);
   const record = downloads.find((entry) => entry.id === fileId);
@@ -285,19 +294,8 @@ async function loadExistingDownloads() {
 }
 
 function announceSelf() {
-  const payload = Buffer.from(
-    JSON.stringify({
-      type: 'announce',
-      id: DEVICE_ID,
-      name: DEVICE_NAME,
-      address: localAddress,
-      httpPort: HTTP_PORT,
-      tokenRequired: Boolean(ACCESS_PIN)
-    })
-  );
-
-  discoverySocket.send(payload, DISCOVERY_PORT, '255.255.255.255');
-  discoverySocket.send(payload, DISCOVERY_PORT, '127.0.0.1');
+  const payload = Buffer.from(JSON.stringify(buildLocalSendIdentity({ announce: true })));
+  discoverySocket.send(payload, DISCOVERY_PORT, DISCOVERY_ADDRESS);
 }
 
 function expirePeers() {
@@ -320,9 +318,17 @@ function buildSelfDevice() {
   return {
     id: DEVICE_ID,
     name: DEVICE_NAME,
+    alias: DEVICE_NAME,
+    fingerprint: FINGERPRINT,
+    version: PROTOCOL_VERSION,
+    deviceModel: DEVICE_MODEL,
+    deviceType: DEVICE_TYPE,
     address: localAddress,
     httpPort: HTTP_PORT,
-    baseUrl: `http://${localAddress}:${HTTP_PORT}`,
+    protocol: HTTP_PROTOCOL,
+    download: true,
+    discoveryProtocol: 'localsend-v2',
+    baseUrl: `${HTTP_PROTOCOL}://${localAddress}:${HTTP_PORT}`,
     tokenRequired: Boolean(ACCESS_PIN)
   };
 }
@@ -334,8 +340,16 @@ function listPeers() {
       name: peer.name,
       address: peer.address,
       httpPort: peer.httpPort,
+      protocol: peer.protocol,
+      version: peer.version,
+      fingerprint: peer.fingerprint,
+      deviceModel: peer.deviceModel,
+      deviceType: peer.deviceType,
+      download: peer.download,
       tokenRequired: peer.tokenRequired,
-      baseUrl: `http://${peer.address}:${peer.httpPort}`,
+      discoveryMethod: peer.discoveryMethod,
+      supportsCustomUpload: peer.supportsCustomUpload,
+      baseUrl: `${peer.protocol}://${peer.address}:${peer.httpPort}`,
       lastSeen: peer.lastSeen
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
@@ -343,7 +357,7 @@ function listPeers() {
 
 function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,PUT,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-File-Size, X-File-Type, X-Device-Token');
 }
 
@@ -427,13 +441,242 @@ function pickLocalAddress() {
   return '127.0.0.1';
 }
 
+function listLocalIpv4Addresses() {
+  const interfaces = os.networkInterfaces();
+  const addresses = [];
+
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries || []) {
+      if (entry.family === 'IPv4' && !entry.internal) {
+        addresses.push(entry.address);
+      }
+    }
+  }
+
+  return addresses;
+}
+
 function hasPeerChanged(previous, next) {
   return (
     previous.name !== next.name ||
     previous.address !== next.address ||
     previous.httpPort !== next.httpPort ||
-    previous.tokenRequired !== next.tokenRequired
+    previous.protocol !== next.protocol ||
+    previous.version !== next.version ||
+    previous.deviceModel !== next.deviceModel ||
+    previous.deviceType !== next.deviceType ||
+    previous.download !== next.download ||
+    previous.tokenRequired !== next.tokenRequired ||
+    previous.supportsCustomUpload !== next.supportsCustomUpload
   );
+}
+
+async function handleDiscoveryMessage(payload, rinfo) {
+  if (!isLocalSendPeerPayload(payload) || !hasEndpointInfo(payload) || payload.fingerprint === FINGERPRINT) {
+    return;
+  }
+
+  const peer = normalizeLocalSendPeer(payload, normalizeRemoteAddress(rinfo.address), 'udp-multicast');
+  upsertPeer(peer);
+
+  if (payload.announce === true) {
+    maybeReplyToAnnouncement(peer, rinfo.port);
+  }
+}
+
+function joinDiscoveryGroups() {
+  if (localInterfaces.length === 0) {
+    try {
+      discoverySocket.addMembership(DISCOVERY_ADDRESS);
+    } catch (error) {
+      console.warn('[udp] addMembership default failed', error.message);
+    }
+    return;
+  }
+
+  for (const address of localInterfaces) {
+    try {
+      discoverySocket.addMembership(DISCOVERY_ADDRESS, address);
+    } catch (error) {
+      console.warn(`[udp] addMembership failed for ${address}`, error.message);
+    }
+  }
+}
+
+function buildLocalSendIdentity(overrides = {}) {
+  return {
+    alias: DEVICE_NAME,
+    version: PROTOCOL_VERSION,
+    deviceModel: DEVICE_MODEL,
+    deviceType: DEVICE_TYPE,
+    fingerprint: FINGERPRINT,
+    port: HTTP_PORT,
+    protocol: HTTP_PROTOCOL,
+    download: true,
+    ...overrides
+  };
+}
+
+function isLocalSendPeerPayload(payload) {
+  return (
+    payload &&
+    typeof payload === 'object' &&
+    typeof payload.alias === 'string' &&
+    typeof payload.fingerprint === 'string'
+  );
+}
+
+function hasEndpointInfo(payload) {
+  return typeof payload?.port === 'number' && typeof payload?.protocol === 'string';
+}
+
+function normalizeLocalSendPeer(payload, address, discoveryMethod, fallback = {}) {
+  const protocol = payload.protocol || fallback.protocol || 'http';
+  const httpPort = Number(payload.port ?? fallback.httpPort) || HTTP_PORT;
+
+  return {
+    id: payload.fingerprint,
+    fingerprint: payload.fingerprint,
+    name: payload.alias || 'Unknown Device',
+    address,
+    httpPort,
+    protocol: protocol === 'https' ? 'https' : 'http',
+    version: payload.version || fallback.version || PROTOCOL_VERSION,
+    deviceModel: payload.deviceModel || null,
+    deviceType: payload.deviceType || null,
+    download: Boolean(payload.download),
+    tokenRequired: false,
+    discoveryMethod,
+    supportsCustomUpload: protocol === 'http' ? null : false,
+    lastSeen: Date.now()
+  };
+}
+
+function upsertPeer(peer) {
+  const previous = peers.get(peer.id);
+  const merged = previous
+    ? {
+        ...previous,
+        ...peer,
+        supportsCustomUpload:
+          peer.supportsCustomUpload !== null && peer.supportsCustomUpload !== undefined
+            ? peer.supportsCustomUpload
+            : previous.supportsCustomUpload
+      }
+    : peer;
+
+  peers.set(peer.id, merged);
+
+  if (!previous || hasPeerChanged(previous, merged)) {
+    broadcastJson({ type: 'peers', peers: listPeers() });
+  }
+
+  if (merged.protocol === 'http' && merged.supportsCustomUpload === null) {
+    void probeCustomUploadSupport(merged.id);
+  }
+}
+
+function maybeReplyToAnnouncement(peer, replyPort) {
+  const lastReplyAt = recentRegisterReplies.get(peer.id) || 0;
+  if (Date.now() - lastReplyAt < 3000) {
+    return;
+  }
+
+  recentRegisterReplies.set(peer.id, Date.now());
+  void sendRegisterToPeer(peer);
+  sendUdpFallbackResponse(peer.address, replyPort);
+}
+
+async function sendRegisterToPeer(peer) {
+  try {
+    const response = await fetch(`${peer.protocol}://${peer.address}:${peer.httpPort}/api/localsend/v2/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(buildLocalSendIdentity()),
+      signal: AbortSignal.timeout(2000)
+    });
+
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (isLocalSendPeerPayload(payload)) {
+      upsertPeer(normalizeLocalSendPeer(payload, peer.address, 'http-register', peer));
+    }
+  } catch {
+    // UDP fallback below covers the discovery case where HTTP register is blocked.
+  }
+}
+
+function sendUdpFallbackResponse(address, port) {
+  const payload = Buffer.from(JSON.stringify(buildLocalSendIdentity({ announce: false })));
+  discoverySocket.send(payload, port, address);
+}
+
+async function probeCustomUploadSupport(peerId) {
+  if (activeProbes.has(peerId)) {
+    return;
+  }
+
+  const peer = peers.get(peerId);
+  if (!peer || peer.protocol !== 'http') {
+    return;
+  }
+
+  activeProbes.add(peerId);
+
+  try {
+    const response = await fetch(`${peer.protocol}://${peer.address}:${peer.httpPort}/api/info`, {
+      signal: AbortSignal.timeout(1500)
+    });
+    const payload = response.ok ? await response.json() : null;
+    updatePeerCompatibility(peerId, Boolean(payload && payload.device));
+  } catch {
+    updatePeerCompatibility(peerId, false);
+  } finally {
+    activeProbes.delete(peerId);
+  }
+}
+
+function updatePeerCompatibility(peerId, supportsCustomUpload) {
+  const peer = peers.get(peerId);
+  if (!peer || peer.supportsCustomUpload === supportsCustomUpload) {
+    return;
+  }
+
+  peers.set(peerId, {
+    ...peer,
+    supportsCustomUpload
+  });
+  broadcastJson({ type: 'peers', peers: listPeers() });
+}
+
+async function readJsonBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(chunk);
+  }
+
+  if (chunks.length === 0) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeRemoteAddress(address) {
+  if (!address) {
+    return '127.0.0.1';
+  }
+
+  return address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
 }
 
 function contentTypeFor(filePath) {

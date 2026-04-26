@@ -32,10 +32,31 @@ try {
   const infoPayload = await infoResponse.json();
   assert.equal(infoPayload.device.name, 'smoke-test-device');
 
+  const registerResponse = await fetch(`http://127.0.0.1:${port}/api/localsend/v2/register`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      alias: 'peer-device',
+      version: '2.0',
+      deviceModel: 'Test Rig',
+      deviceType: 'desktop',
+      fingerprint: 'peer-device-fingerprint',
+      port,
+      protocol: 'http',
+      download: true
+    })
+  });
+  assert.equal(registerResponse.status, 200);
+  const registerPayload = await registerResponse.json();
+  assert.equal(registerPayload.alias, 'smoke-test-device');
+
   const peersResponse = await fetch(`http://127.0.0.1:${port}/api/peers`);
   assert.equal(peersResponse.status, 200);
   const peersPayload = await peersResponse.json();
   assert.ok(Array.isArray(peersPayload.peers));
+  assert.equal(peersPayload.peers[0].fingerprint, 'peer-device-fingerprint');
 
   const uploadsResponse = await fetch(`http://127.0.0.1:${port}/api/downloads`);
   assert.equal(uploadsResponse.status, 200);
